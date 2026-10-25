@@ -1,4 +1,4 @@
-# ScamLens: AI Scam Investigator
+# ScanLense: AI Scam Investigator
 
 ScamLens helps users and cybersecurity analysts assess suspicious messages and screenshots with explainable, multimodal scam detection powered by Google Gemini.
 
@@ -60,4 +60,3 @@ The app is available at `http://localhost:8501`. If PowerShell blocks virtual-en
 ## Demo Scenarios
 
 The sidebar includes synthetic examples for an urgent OTP scam, a fake delivery-fee message, and a routine appointment reminder. Do not test with real credentials or sensitive personal information.
-# ScamLens-Threat
