@@ -1,14 +1,13 @@
 """
-Comprehensive test suite for ScamLens:
-- Schema validation & malformed output handling
-- Input validation
-- Mocked tests for:
-  1. Primary model success
-  2. Temporary 503 UNAVAILABLE followed by success (exponential backoff & jitter)
-  3. Fallback model success upon primary failure
-  4. Exhausted retries raising GeminiUnavailableError
-  5. Invalid API credentials raising GeminiAuthError immediately without retrying
-- Live Gemini API integration test (if key and network are available)
+Comprehensive test suite for ScamLens Advanced Platform:
+- Phase 1: Gemini retries, 503 exponential backoff & jitter, fallback switching, credential failure
+- Phase 2: URL extraction, normalization, threat intelligence lookups, caching, provider failure
+- Phase 3: Specialist text classifier, HF failure handling, local heuristic fallback
+- Phase 4: OCR evidence extraction, low-res/blank image handling
+- Phase 5: URL static feature engineering (IP host, shortener, brand spoofing, length, deceptive chars)
+- Phase 6: Multi-source evidence fusion, confirmed threat intel escalation, conflicting signals, incomplete analysis
+- Phase 8: Benchmark metrics calculation and pipeline comparison
+- Live Gemini API integration test (if network and key are available)
 """
 
 import os
@@ -38,6 +37,38 @@ from app import (
     SYSTEM_INSTRUCTION,
 )
 
+from modules.url_threat_intel import (
+    extract_urls,
+    normalize_url,
+    URLThreatReport,
+    GoogleSafeBrowsingProvider,
+    ThreatIntelManager,
+)
+from modules.url_features import (
+    analyze_url_features,
+    is_ip_address,
+    URLFeatureReport,
+)
+from modules.ml_classifier import (
+    SpecialistClassifier,
+    local_heuristic_classify,
+    ClassifierResult,
+)
+from modules.ocr_engine import (
+    perform_screenshot_ocr,
+    extract_evidence_from_ocr_text,
+    OCRExtractedEvidence,
+)
+from modules.evidence_fusion import (
+    fuse_investigation_evidence,
+    FusedInvestigationReport,
+)
+from modules.benchmark import (
+    evaluate_pipeline,
+    calculate_metrics,
+    BENCHMARK_DATASET,
+)
+
 SAMPLE_PARSED_RESULT = ScamAnalysisResult(
     risk_score=92,
     risk_level="CRITICAL",
@@ -62,6 +93,8 @@ def create_mock_response():
 
 
 class TestScamLens(unittest.TestCase):
+
+    # --- BASELINE VALIDATION TESTS ---
 
     def test_pydantic_schema_validation(self):
         """Test schema validation for structured analysis output."""
@@ -126,11 +159,11 @@ class TestScamLens(unittest.TestCase):
         self.assertNotIn("REDACTED_TEST_KEY", sanitized)
         self.assertIn("[REDACTED", sanitized)
 
-    # --- MOCKED GEMINI API TESTS (Requirement 10) ---
+    # --- PHASE 1: MOCKED GEMINI API RESILIENCE TESTS ---
 
     @patch("time.sleep", return_value=None)
     def test_mock_primary_success(self, mock_sleep):
-        """Test 1: Primary model succeeds on first attempt."""
+        """Test: Primary model succeeds on first attempt."""
         mock_client = MagicMock()
         mock_resp = create_mock_response()
         mock_client.models.generate_content.return_value = mock_resp
@@ -150,7 +183,7 @@ class TestScamLens(unittest.TestCase):
 
     @patch("time.sleep", return_value=None)
     def test_mock_temporary_503_followed_by_success(self, mock_sleep):
-        """Test 2: Temporary 503 UNAVAILABLE on attempt 1, succeeds on attempt 2."""
+        """Test: Temporary 503 UNAVAILABLE on attempt 1, succeeds on attempt 2."""
         mock_client = MagicMock()
         mock_resp = create_mock_response()
         mock_client.models.generate_content.side_effect = [
@@ -169,12 +202,11 @@ class TestScamLens(unittest.TestCase):
         self.assertEqual(result.risk_score, 92)
         self.assertEqual(result.model_used, "gemini-3.8-flash")
         self.assertEqual(mock_client.models.generate_content.call_count, 2)
-        # Verify backoff sleep was invoked
         mock_sleep.assert_called_once()
 
     @patch("time.sleep", return_value=None)
     def test_mock_fallback_success(self, mock_sleep):
-        """Test 3: Primary model fails with 503 on all retries, switches to fallback model and succeeds."""
+        """Test: Primary model fails with 503 on all retries, switches to fallback model and succeeds."""
         mock_client = MagicMock()
         mock_resp = create_mock_response()
 
@@ -197,12 +229,11 @@ class TestScamLens(unittest.TestCase):
 
         self.assertEqual(result.risk_score, 92)
         self.assertEqual(result.model_used, "gemini-3.5-flash")
-        # Primary called 2 times, then fallback called 1 time = 3 calls
         self.assertEqual(mock_client.models.generate_content.call_count, 3)
 
     @patch("time.sleep", return_value=None)
     def test_mock_exhausted_retries(self, mock_sleep):
-        """Test 4: Both primary and fallback models fail with 503, raises GeminiUnavailableError."""
+        """Test: Both primary and fallback models fail with 503, raises GeminiUnavailableError."""
         mock_client = MagicMock()
         mock_client.models.generate_content.side_effect = Exception("503 UNAVAILABLE: High demand across all regions")
 
@@ -216,12 +247,11 @@ class TestScamLens(unittest.TestCase):
             )
 
         self.assertIn("experiencing high demand", str(ctx.exception))
-        # Total calls: 2 for primary + 2 for fallback = 4 calls total (bounded, no infinite loop)
         self.assertEqual(mock_client.models.generate_content.call_count, 4)
 
     @patch("time.sleep", return_value=None)
     def test_mock_invalid_api_credentials(self, mock_sleep):
-        """Test 5: Invalid API key fails immediately with GeminiAuthError; does NOT retry or mask."""
+        """Test: Invalid API key fails immediately with GeminiAuthError; does NOT retry or mask."""
         mock_client = MagicMock()
         mock_client.models.generate_content.side_effect = Exception("API_KEY_INVALID: 400 Bad Request. Provided API key is invalid.")
 
@@ -235,9 +265,209 @@ class TestScamLens(unittest.TestCase):
             )
 
         self.assertIn("rejected the API key as invalid", str(ctx.exception))
-        # Must fail immediately on attempt 1 without retries and without fallback
         self.assertEqual(mock_client.models.generate_content.call_count, 1)
         mock_sleep.assert_not_called()
+
+    # --- PHASE 2: URL THREAT INTELLIGENCE TESTS ---
+
+    def test_url_extraction_and_normalization(self):
+        """Test safe URL extraction and RFC-compliant normalization."""
+        sample_text = "Check your package at http://usps-track.xyz/pay. Also visit (https://secure-chase.com/login?u=1) and www.apple-support.co/now!"
+        urls = extract_urls(sample_text)
+        self.assertEqual(len(urls), 3)
+        self.assertIn("http://usps-track.xyz/pay", urls)
+        self.assertIn("https://secure-chase.com/login?u=1", urls)
+        self.assertIn("http://www.apple-support.co/now", urls)
+
+        # Test edge case normalization
+        self.assertEqual(normalize_url("  http://example.COM/path/  "), "http://example.com/path/")
+        self.assertIsNone(normalize_url("not_a_valid_url"))
+
+    @patch("requests.post")
+    def test_google_safe_browsing_match_and_caching(self, mock_post):
+        """Test Google Safe Browsing provider hit and manager in-memory caching."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "matches": [
+                {
+                    "threatType": "SOCIAL_ENGINEERING",
+                    "threat": {"url": "http://evil-phish.xyz"}
+                }
+            ]
+        }
+        mock_post.return_value = mock_resp
+
+        provider = GoogleSafeBrowsingProvider(api_key="mock_key")
+        mgr = ThreatIntelManager(providers=[provider])
+
+        reports = mgr.check_urls(["http://evil-phish.xyz", "http://clean-site.org"])
+        self.assertEqual(len(reports), 2)
+        evil_rep = next(r for r in reports if r.url == "http://evil-phish.xyz")
+        clean_rep = next(r for r in reports if r.url == "http://clean-site.org")
+
+        self.assertEqual(evil_rep.status, "MATCH_FOUND")
+        self.assertIn("SOCIAL_ENGINEERING", evil_rep.threat_types)
+        self.assertEqual(clean_rep.status, "NO_MATCH")
+        self.assertFalse(clean_rep.is_safe_guarantee)
+
+        # Test caching: querying evil-phish again should not trigger another requests.post
+        call_count_before = mock_post.call_count
+        cached_reports = mgr.check_urls(["http://evil-phish.xyz"])
+        self.assertEqual(mock_post.call_count, call_count_before)
+        self.assertEqual(cached_reports[0].status, "MATCH_FOUND")
+
+    @patch("requests.post", side_effect=Exception("Connection timeout"))
+    def test_safe_browsing_provider_failure_handling(self, mock_post):
+        """Test graceful degradation when threat intel provider experiences network timeout."""
+        provider = GoogleSafeBrowsingProvider(api_key="mock_key")
+        reports = provider.check_urls(["http://suspicious-test.com"])
+        rep = reports["http://suspicious-test.com"]
+        self.assertEqual(rep.status, "PROVIDER_UNAVAILABLE")
+        self.assertIn("Connection timeout", rep.details)
+
+    # --- PHASE 3: SPECIALIST CLASSIFIER TESTS ---
+
+    def test_specialist_classifier_local_fallback(self):
+        """Test specialist classifier pattern heuristics when Hugging Face is disabled/offline."""
+        classifier = SpecialistClassifier()
+        # Test obvious scam prompt
+        scam_text = "Your Chase bank account is suspended immediately. Send the OTP passcode to prevent closure."
+        res = classifier.classify(scam_text)
+        self.assertTrue(res.is_phishing)
+        self.assertGreaterEqual(res.score, 0.50)
+        self.assertFalse(res.is_calibrated_probability)
+
+        # Test routine appointment text
+        benign_text = "Reminder: Your dental appointment is scheduled for tomorrow at 10:30 AM. Arrive 10 minutes early."
+        res_benign = classifier.classify(benign_text)
+        self.assertFalse(res_benign.is_phishing)
+        self.assertLess(res_benign.score, 0.50)
+
+    # --- PHASE 4: OCR EXTRACTION TESTS ---
+
+    def test_ocr_signal_extraction_from_text(self):
+        """Test OCR structured evidence parsing for payment demands, urgency, and senders."""
+        raw_ocr = "From: Chase Security Notice\nYour account has been locked. Pay $25.00 dispatch fee immediately within 10 minutes."
+        evidence = extract_evidence_from_ocr_text(raw_ocr, "Tesseract-Mock", "Mocked image test")
+        self.assertTrue(evidence.is_readable)
+        self.assertIn("Chase", str(evidence.sender_indicators))
+        self.assertTrue(any("$25" in p or "25.00" in p for p in evidence.payment_indicators))
+        self.assertTrue(any("immediately" in u or "within 10 minutes" in u for u in evidence.urgency_indicators))
+
+    def test_ocr_low_res_and_blank_handling(self):
+        """Test handling of tiny or blank screenshots."""
+        blank_img = Image.new("RGB", (50, 50), color=(255, 255, 255))
+        evidence = perform_screenshot_ocr(blank_img)
+        self.assertIn("Low resolution", evidence.notes)
+        self.assertEqual(evidence.raw_text, "")
+
+    # --- PHASE 5: URL FEATURE ENGINEERING TESTS ---
+
+    def test_url_features_ip_host_and_shortener(self):
+        """Test detection of raw numeric IP hosts and known shorteners."""
+        ip_report = analyze_url_features("http://192.168.1.100/login")
+        self.assertTrue(ip_report.is_ip_host)
+        self.assertGreaterEqual(ip_report.heuristic_risk_score, 60)
+        self.assertTrue(any("Raw IP Address Host" in ind.flag for ind in ip_report.indicators))
+
+        short_report = analyze_url_features("https://bit.ly/claim-prize22")
+        self.assertTrue(short_report.is_shortened)
+        self.assertTrue(short_report.has_https)
+        self.assertTrue(any("Known URL Shortener" in ind.flag for ind in short_report.indicators))
+
+    def test_url_features_brand_spoofing(self):
+        """Test detection of deceptive brand names in unofficial domains."""
+        # paypal.com keyword inside fake root domain security-login.xyz
+        spoof_report = analyze_url_features("http://paypal.com.account-verify.xyz/login")
+        self.assertGreaterEqual(spoof_report.heuristic_risk_score, 60)
+        self.assertTrue(any("Brand Impersonation" in ind.category for ind in spoof_report.indicators))
+
+    # --- PHASE 6: EVIDENCE FUSION ENGINE TESTS ---
+
+    def test_evidence_fusion_confirmed_threat_intel_escalation(self):
+        """Test Rule: Confirmed threat intel match escalates overall risk to CRITICAL 100."""
+        threat_match = URLThreatReport(
+            url="http://known-malicious.com",
+            provider="Google Safe Browsing v4",
+            status="MATCH_FOUND",
+            threat_types=["SOCIAL_ENGINEERING"],
+            details="Confirmed phishing domain"
+        )
+        fused = fuse_investigation_evidence(
+            gemini_result=None,
+            classifier_result=None,
+            url_threat_reports=[threat_match],
+            url_feature_reports=[]
+        )
+        self.assertEqual(fused.overall_risk_score, 100)
+        self.assertEqual(fused.overall_risk_level, "CRITICAL")
+        self.assertTrue(fused.confirmed_threat_intel_match)
+
+    def test_evidence_fusion_conflicting_signals_detection(self):
+        """Test Rule: Significant divergence between Gemini and classifier flags discordance."""
+        mock_gemini = MagicMock()
+        mock_gemini.risk_score = 90
+        mock_gemini.risk_level = "CRITICAL"
+        mock_gemini.summary = "Extremely urgent credential harvesting attempt."
+        mock_gemini.recommended_actions = ["Do not share credentials"]
+
+        # Classifier says low risk
+        low_cls = ClassifierResult(
+            label="BENIGN",
+            score=0.15,
+            is_phishing=False,
+            engine="test",
+            model_name="test",
+            explanation="No patterns"
+        )
+
+        fused = fuse_investigation_evidence(
+            gemini_result=mock_gemini,
+            classifier_result=low_cls,
+            url_threat_reports=[],
+            url_feature_reports=[]
+        )
+        self.assertTrue(fused.has_conflicting_signals)
+        self.assertIn("divergence between Gemini contextual score", str(fused.conflict_explanation))
+
+    def test_evidence_fusion_incomplete_investigation_on_ai_failure(self):
+        """Test Rule: When Gemini fails, fusion marks report as incomplete rather than safe."""
+        fused = fuse_investigation_evidence(
+            gemini_result=None,
+            classifier_result=None,
+            url_threat_reports=[],
+            url_feature_reports=[],
+            gemini_error="503 UNAVAILABLE"
+        )
+        self.assertTrue(fused.is_incomplete)
+        self.assertIn("INCOMPLETE INVESTIGATION", fused.status_summary)
+
+    # --- PHASE 8: BENCHMARK HARNESS TESTS ---
+
+    def test_benchmark_metrics_calculation(self):
+        """Test benchmark metric calculation on dummy predictions."""
+        y_true = ["SCAM", "SCAM", "BENIGN", "BENIGN"]
+        y_pred = ["SCAM", "BENIGN", "BENIGN", "SCAM"]
+        cats = ["Phishing", "Phishing", "Legit", "Legit"]
+
+        metrics = calculate_metrics(y_true, y_pred, cats)
+        self.assertEqual(metrics.total_samples, 4)
+        self.assertEqual(metrics.true_positives, 1)
+        self.assertEqual(metrics.false_positives, 1)
+        self.assertEqual(metrics.true_negatives, 1)
+        self.assertEqual(metrics.false_negatives, 1)
+        self.assertEqual(metrics.precision, 0.5)
+        self.assertEqual(metrics.recall, 0.5)
+        self.assertEqual(metrics.f1_score, 0.5)
+        self.assertEqual(metrics.false_positive_rate, 0.5)
+
+    def test_benchmark_pipeline_runs_without_crashing(self):
+        """Test that the benchmark pipeline executes cleanly across the 7 categories."""
+        metrics = evaluate_pipeline(use_evidence_fusion=True)
+        self.assertGreater(metrics.total_samples, 10)
+        self.assertGreater(metrics.precision, 0.0)
+        self.assertGreater(metrics.recall, 0.0)
 
 
 def run_live_tests_if_available():
@@ -263,7 +493,7 @@ if __name__ == "__main__":
     test_result = runner.run(suite)
 
     if test_result.wasSuccessful():
-        print("\n[ALL 9 UNIT AND MOCKED TESTS PASSED SUCCESSFULLY!]")
+        print(f"\n[ALL {test_result.testsRun} COMPREHENSIVE TESTS PASSED SUCCESSFULLY!]")
         run_live_tests_if_available()
     else:
         sys.exit(1)

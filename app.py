@@ -1,6 +1,7 @@
 """
 ScamLens: AI Scam Investigator
-An explainable, multimodal cybersecurity decision-support tool powered by Google Gemini.
+An explainable, multimodal cybersecurity decision-support platform powered by Google Gemini,
+Specialist ML Classification, URL Feature Engineering, Threat Intelligence, and Vision OCR.
 """
 
 import os
@@ -10,7 +11,7 @@ import re
 import time
 import random
 from datetime import datetime
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any, Dict
 from PIL import Image
 from dotenv import load_dotenv
 import streamlit as st
@@ -18,6 +19,30 @@ from pydantic import BaseModel, Field
 
 # Load local environment variables from .env if present
 load_dotenv()
+
+# Import specialized modular engines
+from modules.url_threat_intel import (
+    extract_urls,
+    URLThreatReport,
+    ThreatIntelManager,
+    GoogleSafeBrowsingProvider,
+)
+from modules.url_features import (
+    analyze_url_features,
+    URLFeatureReport,
+)
+from modules.ml_classifier import (
+    SpecialistClassifier,
+    ClassifierResult,
+)
+from modules.ocr_engine import (
+    perform_screenshot_ocr,
+    OCRExtractedEvidence,
+)
+from modules.evidence_fusion import (
+    fuse_investigation_evidence,
+    FusedInvestigationReport,
+)
 
 # --- Safe Logging Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -288,7 +313,6 @@ def execute_gemini_generate_with_retry(
                 # Transient errors (503 high demand, 429 rate limit, network disruption)
                 if err_category in ("transient_unavailable", "rate_limit", "network"):
                     if attempt < max_retries - 1:
-                        # Bounded backoff with jitter and Retry-After
                         retry_after = extract_retry_after(e)
                         if retry_after is not None and retry_after > 0:
                             sleep_time = min(retry_after, max_delay)
@@ -441,7 +465,6 @@ def analyze_with_gemini(
 
 def render_ui():
     """Renders the Streamlit frontend UI."""
-    # Page Configuration
     st.set_page_config(
         page_title="ScamLens — AI Scam Investigator",
         page_icon="🛡️",
@@ -619,6 +642,16 @@ def render_ui():
         st.session_state.input_text = ""
     if "current_result" not in st.session_state:
         st.session_state.current_result = None
+    if "current_fused_report" not in st.session_state:
+        st.session_state.current_fused_report = None
+    if "current_url_features" not in st.session_state:
+        st.session_state.current_url_features = []
+    if "current_threat_reports" not in st.session_state:
+        st.session_state.current_threat_reports = []
+    if "current_classifier_result" not in st.session_state:
+        st.session_state.current_classifier_result = None
+    if "current_ocr_evidence" not in st.session_state:
+        st.session_state.current_ocr_evidence = None
     if "current_analyzed_content" not in st.session_state:
         st.session_state.current_analyzed_content = None
     if "last_error" not in st.session_state:
@@ -632,10 +665,10 @@ def render_ui():
                 <div class="hero-title">
                     <span>🛡️ ScamLens</span>
                 </div>
-                <p class="hero-tagline">AI-Powered Scam Investigator & Decision-Support System</p>
+                <p class="hero-tagline">AI-Powered Scam Investigator & Multi-Source Evidence Fusion Platform</p>
             </div>
             <div>
-                <span class="status-pill">● System Operational</span>
+                <span class="status-pill">● Multi-Engine Active</span>
             </div>
         </div>
     </div>
@@ -650,15 +683,19 @@ def render_ui():
         fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash")
 
         if has_key:
-            st.success("🔑 API Key: **Loaded**")
+            st.success("🔑 Gemini Key: **Loaded**")
         else:
-            st.error("🔑 API Key: **Missing or Default**")
+            st.error("🔑 Gemini Key: **Missing or Default**")
             st.caption("Add `GEMINI_API_KEY` to your `.env` file to enable live analysis.")
 
         model_desc = f"🧠 Model: `{active_model}`"
         if fallback_model and fallback_model.strip():
             model_desc += f"\n\n🔄 Fallback: `{fallback_model.strip()}`"
         st.info(model_desc)
+
+        has_sb_key = bool(os.getenv("SAFE_BROWSING_API_KEY") or configured_key)
+        st.markdown(f"🌐 **Safe Browsing**: `{'Enabled' if has_sb_key else 'Unconfigured'}`")
+        st.markdown(f"🤖 **NLP Classifier**: `Active (Heuristic + HF)`")
 
         st.markdown("---")
         st.markdown("### 📋 Synthetic Demo Scenarios")
@@ -686,20 +723,24 @@ def render_ui():
             st.rerun()
 
         st.markdown("---")
-        st.markdown("### 🛡️ Safety & Architecture")
+        st.markdown("### 🛡️ Fusion Architecture")
         st.markdown("""
-        - **Multimodal Gemini Vision**: Analyzes both raw text and screenshots.
-        - **High-Demand Resilience**: Bounded exponential backoff + jitter for transient 503 errors.
-        - **Automatic Fallback Switching**: Seamlessly transfers to fallback model if primary is overloaded.
-        - **Zero Disk Storage**: Uploaded screenshots and messages are processed strictly in-memory.
-        - **No Link Traversal**: ScamLens **never** opens or follows external URLs found in inputs.
-        - **Explainable Signals**: Highlights explicit social engineering tactics and red flags.
+        - **1. Gemini Vision/Text**: Deep multimodal LLM contextual analysis.
+        - **2. URL Threat Intel**: Real-time Google Safe Browsing API matches.
+        - **3. URL Feature Engineering**: Static domain spoofing, IP host, and shortener detection.
+        - **4. Specialist Classifier**: Specialized phishing pattern scoring.
+        - **5. OCR Engine**: Extracts visible text, sender details, and fee demands.
         """)
 
         st.markdown("---")
         if st.button("🗑️ Reset All & Clear History", use_container_width=True):
             st.session_state.history = []
             st.session_state.current_result = None
+            st.session_state.current_fused_report = None
+            st.session_state.current_url_features = []
+            st.session_state.current_threat_reports = []
+            st.session_state.current_classifier_result = None
+            st.session_state.current_ocr_evidence = None
             st.session_state.input_text = ""
             st.session_state.current_analyzed_content = None
             st.session_state.last_error = None
@@ -756,6 +797,11 @@ def render_ui():
             if st.button("Clear Input", use_container_width=True):
                 st.session_state.input_text = ""
                 st.session_state.current_result = None
+                st.session_state.current_fused_report = None
+                st.session_state.current_url_features = []
+                st.session_state.current_threat_reports = []
+                st.session_state.current_classifier_result = None
+                st.session_state.current_ocr_evidence = None
                 st.session_state.current_analyzed_content = None
                 st.session_state.last_error = None
                 st.rerun()
@@ -766,74 +812,100 @@ def render_ui():
             elif mode == "Screenshot / Image Upload" and image_to_analyze is None:
                 st.warning("⚠️ Please upload a valid image file (PNG, JPG, WEBP) before running analysis.")
             else:
-                with st.spinner("🔬 Scanning for social engineering, urgency tactics, and credential harvesting..."):
+                with st.spinner("🔬 Fusing signals: Gemini Vision, Threat Intelligence, URL Engineering, and Classifier..."):
+                    # 1. Image OCR extraction if screenshot mode
+                    ocr_evidence: Optional[OCRExtractedEvidence] = None
+                    if image_to_analyze is not None:
+                        ocr_evidence = perform_screenshot_ocr(image_to_analyze)
+                        st.session_state.current_ocr_evidence = ocr_evidence
+
+                    # 2. Extract and analyze URLs
+                    content_for_urls = (text_to_analyze or "")
+                    if ocr_evidence and ocr_evidence.raw_text:
+                        content_for_urls += " " + ocr_evidence.raw_text
+
+                    extracted_urls = extract_urls(content_for_urls)
+                    url_features = [analyze_url_features(u) for u in extracted_urls]
+                    st.session_state.current_url_features = url_features
+
+                    # 3. URL Threat Intelligence lookups (Safe Browsing)
+                    threat_mgr = ThreatIntelManager()
+                    threat_reports = threat_mgr.check_urls(extracted_urls)
+                    st.session_state.current_threat_reports = threat_reports
+
+                    # 4. Specialist Classifier
+                    classifier = SpecialistClassifier()
+                    text_for_classifier = text_to_analyze if text_to_analyze.strip() else (ocr_evidence.raw_text if ocr_evidence else "")
+                    classifier_res = classifier.classify(text_for_classifier)
+                    st.session_state.current_classifier_result = classifier_res
+
+                    # 5. Gemini Multimodal Analysis (with retries and fallback)
+                    gemini_res = None
+                    gemini_error = None
                     try:
-                        result = analyze_with_gemini(
+                        gemini_res = analyze_with_gemini(
                             text_input=text_to_analyze if text_to_analyze.strip() else None,
                             image_input=image_to_analyze
                         )
-                        st.session_state.current_result = result
+                        st.session_state.current_result = gemini_res
                         st.session_state.last_error = None
-                        snippet = (text_to_analyze[:60] + "...") if text_to_analyze.strip() else f"Image Screenshot ({mode})"
-                        st.session_state.current_analyzed_content = snippet
-
-                        st.session_state.history.insert(0, {
-                            "time": datetime.now().strftime("%H:%M:%S"),
-                            "mode": mode,
-                            "snippet": snippet,
-                            "risk_score": result.risk_score,
-                            "risk_level": result.risk_level,
-                            "summary": result.summary
-                        })
-                        if len(st.session_state.history) > 10:
-                            st.session_state.history.pop()
-
                     except GeminiAuthError as auth_err:
-                        st.session_state.current_result = None
-                        st.session_state.last_error = str(auth_err)
-                        st.error(f"🔑 Authentication Error: {str(auth_err)}")
+                        gemini_error = str(auth_err)
+                        st.session_state.last_error = gemini_error
+                        st.error(f"🔑 Authentication Error: {gemini_error}")
                     except GeminiUnavailableError as unavail_err:
-                        st.session_state.current_result = None
-                        st.session_state.last_error = str(unavail_err)
-                        st.error(f"⚠️ Service Unavailable: {str(unavail_err)}")
-                        st.info("💡 Tip: Gemini is currently handling high global traffic. Please wait a few seconds and try again.")
+                        gemini_error = str(unavail_err)
+                        st.session_state.last_error = gemini_error
+                        st.warning(f"⚠️ Gemini Service High Demand: {gemini_error}")
                     except Exception as ex:
-                        st.session_state.current_result = None
-                        st.session_state.last_error = str(ex)
-                        st.error(f"⚠️ Analysis Error: {str(ex)}")
+                        gemini_error = str(ex)
+                        st.session_state.last_error = gemini_error
+                        st.warning(f"⚠️ Gemini Analysis Issue: {gemini_error}")
+
+                    # 6. Multi-Source Evidence Fusion
+                    fused_report = fuse_investigation_evidence(
+                        gemini_result=gemini_res,
+                        classifier_result=classifier_res,
+                        url_threat_reports=threat_reports,
+                        url_feature_reports=url_features,
+                        ocr_evidence=ocr_evidence,
+                        gemini_error=gemini_error
+                    )
+                    st.session_state.current_fused_report = fused_report
+
+                    snippet = (text_to_analyze[:60] + "...") if text_to_analyze.strip() else f"Image Screenshot ({mode})"
+                    st.session_state.current_analyzed_content = snippet
+
+                    st.session_state.history.insert(0, {
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "mode": mode,
+                        "snippet": snippet,
+                        "risk_score": fused_report.overall_risk_score,
+                        "risk_level": fused_report.overall_risk_level,
+                        "summary": fused_report.status_summary
+                    })
+                    if len(st.session_state.history) > 10:
+                        st.session_state.history.pop()
 
     with right_col:
-        st.markdown("### 📊 Investigation Report")
+        st.markdown("### 📊 Fused Investigation Report")
+        fused: Optional[FusedInvestigationReport] = st.session_state.current_fused_report
         res: Optional[ScamAnalysisResult] = st.session_state.current_result
-        last_err: Optional[str] = st.session_state.get("last_error")
 
-        if last_err:
-            # Explicit Investigation Unavailable State (Distinguished from safe score)
-            st.markdown(f"""
-            <div class="scam-card" style="border-left: 4px solid #EF4444; background: rgba(239, 68, 68, 0.08); padding: 24px;">
-                <div style="font-size: 2.2rem; margin-bottom: 8px;">⚠️</div>
-                <h4 style="color: #F87171; margin-bottom: 8px;">Investigation Unavailable</h4>
-                <p style="color: #E2E8F0; font-size: 0.95rem; line-height: 1.5; margin-bottom: 12px;">{last_err}</p>
-                <div style="background: rgba(0,0,0,0.3); border-radius: 8px; padding: 12px; font-size: 0.85rem; color: #CBD5E1;">
-                    🛡️ <b>Cybersecurity Advisory:</b> The AI investigation service could not complete the evaluation due to service disruption.
-                    <b>This does NOT mean the message is safe.</b> Treat unexpected messages with caution. Never share OTPs or click unverified links.
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        elif res is None:
+        if fused is None:
             st.markdown("""
             <div class="scam-card" style="text-align: center; padding: 48px 24px;">
                 <div style="font-size: 3rem; margin-bottom: 12px;">🛡️</div>
-                <h4 style="color: #F1F5F9; margin-bottom: 8px;">Awaiting Investigation</h4>
-                <p style="color: #94A3B8; font-size: 0.95rem; max-width: 360px; margin: 0 auto;">
-                    Paste a suspicious message or upload a screenshot on the left and click <b>Investigate</b> to view detailed risk scoring and red flags.
+                <h4 style="color: #F1F5F9; margin-bottom: 8px;">Awaiting Multi-Source Investigation</h4>
+                <p style="color: #94A3B8; font-size: 0.95rem; max-width: 380px; margin: 0 auto;">
+                    Paste a suspicious message or upload a screenshot and click <b>Investigate with ScamLens</b>.
+                    Signals will be synthesized across Gemini, Threat Intelligence, URL Heuristics, and NLP Classifiers.
                 </p>
             </div>
             """, unsafe_allow_html=True)
         else:
-            score = res.risk_score
-            level = res.risk_level.upper()
+            score = fused.overall_risk_score
+            level = fused.overall_risk_level.upper()
 
             if level == "CRITICAL" or score >= 81:
                 risk_class = "risk-critical"
@@ -852,61 +924,156 @@ def render_ui():
                 score_color = "#10B981"
                 level_label = "LOW RISK"
 
+            # Confirmed Threat Banner if present
+            if fused.confirmed_threat_intel_match:
+                st.markdown("""
+                <div style="background: rgba(239, 68, 68, 0.25); border: 2px solid #EF4444; border-radius: 10px; padding: 12px 16px; margin-bottom: 16px;">
+                    <b style="color: #F87171;">🚨 CONFIRMED MALICIOUS URL DETECTED:</b><br>
+                    <span style="font-size: 0.9rem; color: #FCA5A5;">A link in this communication is confirmed malicious on external threat registries.</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Incomplete Analysis Notice if Gemini was unavailable
+            if fused.is_incomplete:
+                st.markdown("""
+                <div style="background: rgba(245, 158, 11, 0.15); border: 1px solid #F59E0B; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px;">
+                    <b style="color: #FBBF24;">⚠️ Investigation Incomplete (AI Service Unavailable):</b><br>
+                    <span style="font-size: 0.88rem; color: #FDE68A;">
+                        Gemini was temporarily unreachable. The score below was synthesized strictly from static URL heuristics, threat registries, and local rules.
+                    </span>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Conflicting signals callout
+            if fused.has_conflicting_signals:
+                st.markdown(f"""
+                <div style="background: rgba(139, 92, 246, 0.15); border: 1px solid #8B5CF6; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px;">
+                    <b style="color: #C4B5FD;">⚖️ Signal Discordance Observed:</b><br>
+                    <span style="font-size: 0.88rem; color: #E9D5FF;">{fused.conflict_explanation}</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Overall Score Meter
             st.markdown(f"""
             <div class="risk-meter-container">
                 <span class="risk-badge {risk_class}">{level_label}</span>
                 <div class="risk-score-display" style="color: {score_color};">{score}<span style="font-size: 1.8rem; color: #64748B;">/100</span></div>
-                <p style="color: #94A3B8; margin: 0; font-size: 0.95rem;">Overall Social Engineering & Deception Score</p>
+                <p style="color: #94A3B8; margin: 0; font-size: 0.95rem;">Fused Multi-Signal Risk Score</p>
             </div>
             """, unsafe_allow_html=True)
-
-            if getattr(res, "model_used", None):
-                st.caption(f"🤖 Evaluated using: `{res.model_used}`")
 
             st.markdown("<br>", unsafe_allow_html=True)
 
-            st.markdown("#### 📝 Executive Summary")
+            # Executive Summary
+            st.markdown("#### 📝 Unified Executive Summary")
             st.markdown(f"""
             <div class="scam-card" style="border-left: 4px solid {score_color};">
-                <p style="margin: 0; line-height: 1.5; color: #F1F5F9;">{res.summary}</p>
+                <p style="margin: 0; line-height: 1.5; color: #F1F5F9;">{fused.status_summary}</p>
             </div>
             """, unsafe_allow_html=True)
 
-            if res.red_flags:
-                st.markdown(f"#### 🚩 Detected Red Flags ({len(res.red_flags)})")
-                for flag in res.red_flags:
+            # Multi-Engine Detailed Breakdown Tabs
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                "🧠 Gemini AI",
+                "🌐 Threat Intel",
+                "🔬 URL Features",
+                "🤖 NLP Classifier",
+                "👁️ OCR Vision"
+            ])
+
+            with tab1:
+                if res is not None:
+                    if getattr(res, "model_used", None):
+                        st.caption(f"🤖 Evaluated using: `{res.model_used}`")
+                    if res.red_flags:
+                        st.markdown(f"**Identified Red Flags ({len(res.red_flags)}):**")
+                        for flag in res.red_flags:
+                            st.markdown(f"""
+                            <div class="red-flag-item">
+                                <div class="flag-title">⚠️ {flag.title}</div>
+                                <div><span class="flag-evidence">Observed: "{flag.evidence}"</span></div>
+                                <div class="flag-explanation">{flag.explanation}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    else:
+                        st.info("No prominent behavioral red flags flagged by Gemini.")
+
+                    if res.positive_signals:
+                        st.markdown("**Positive / Routine Signals:**")
+                        for pos in res.positive_signals:
+                            st.markdown(f"<div class='positive-item'>✓ {pos}</div>", unsafe_allow_html=True)
+                else:
+                    st.info("Gemini analysis was unavailable for this session. See other tabs for local inspections.")
+
+            with tab2:
+                threat_reps = st.session_state.current_threat_reports
+                if threat_reps:
+                    for tr in threat_reps:
+                        status_color = "#EF4444" if tr.status == "MATCH_FOUND" else ("#10B981" if tr.status == "NO_MATCH" else "#F59E0B")
+                        st.markdown(f"""
+                        <div class="scam-card" style="border-left: 4px solid {status_color};">
+                            <b>URL:</b> <code>{tr.url}</code><br>
+                            <b>Provider:</b> {tr.provider}<br>
+                            <b>Status:</b> <code>{tr.status}</code><br>
+                            <p style="color: #CBD5E1; margin-top: 6px; font-size: 0.9rem;">{tr.details}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                else:
+                    st.caption("No external URLs detected in message to query against reputation providers.")
+
+            with tab3:
+                url_feats = st.session_state.current_url_features
+                if url_feats:
+                    for uf in url_feats:
+                        st.markdown(f"""
+                        <div class="scam-card">
+                            <b>Target Domain:</b> <code>{uf.domain}</code> | <b>Heuristic Score:</b> <code>{uf.heuristic_risk_score}/100 ({uf.risk_level})</code><br>
+                            <b>HTTPS:</b> {'✅ Yes' if uf.has_https else '❌ No (HTTP)'} | <b>IP Host:</b> {'⚠️ Yes' if uf.is_ip_host else 'No'} | <b>Shortener:</b> {'⚠️ Yes' if uf.is_shortened else 'No'}
+                        </div>
+                        """, unsafe_allow_html=True)
+                        for ind in uf.indicators:
+                            st.markdown(f"- **[{ind.severity}] {ind.flag}**: {ind.explanation}")
+                else:
+                    st.caption("No external URLs found in the communication.")
+
+            with tab4:
+                cls_res: Optional[ClassifierResult] = st.session_state.current_classifier_result
+                if cls_res:
                     st.markdown(f"""
-                    <div class="red-flag-item">
-                        <div class="flag-title">⚠️ {flag.title}</div>
-                        <div><span class="flag-evidence">Observed: "{flag.evidence}"</span></div>
-                        <div class="flag-explanation">{flag.explanation}</div>
+                    <div class="scam-card">
+                        <b>Engine:</b> <code>{cls_res.engine}</code> ({cls_res.model_name})<br>
+                        <b>Predicted Class:</b> <code>{cls_res.label}</code><br>
+                        <b>Raw Model Score:</b> <code>{cls_res.score:.3f}</code> (Heuristic metric, not calibrated probability)<br>
+                        <p style="color: #CBD5E1; margin-top: 6px; font-size: 0.9rem;"><b>Rationale:</b> {cls_res.explanation}</p>
                     </div>
                     """, unsafe_allow_html=True)
-            else:
-                st.info("ℹ️ No prominent social engineering red flags or deceptive patterns detected.")
+                else:
+                    st.caption("No text available for NLP classification.")
 
-            if res.positive_signals:
-                st.markdown("#### 🔍 Positive / Neutral Observations")
-                for pos in res.positive_signals:
-                    st.markdown(f"""
-                    <div class="positive-item">
-                        ✓ {pos}
-                    </div>
-                    """, unsafe_allow_html=True)
+            with tab5:
+                ocr_ev: Optional[OCRExtractedEvidence] = st.session_state.current_ocr_evidence
+                if ocr_ev and ocr_ev.raw_text:
+                    st.markdown(f"**OCR Engine:** `{ocr_ev.ocr_engine}` | **Notes:** {ocr_ev.notes}")
+                    st.text_area("Visible Text Extracted from Screenshot", value=ocr_ev.raw_text, height=120, disabled=True)
+                    if ocr_ev.payment_indicators:
+                        st.markdown(f"**Payment Phrases Detected:** `{'`, `'.join(ocr_ev.payment_indicators)}`")
+                    if ocr_ev.urgency_indicators:
+                        st.markdown(f"**Urgency Terms Detected:** `{'`, `'.join(ocr_ev.urgency_indicators)}`")
+                else:
+                    st.caption("Screenshot OCR is active during image uploads.")
 
-            if res.recommended_actions:
-                st.markdown("#### 🛡️ Recommended Immediate Actions")
-                for act in res.recommended_actions:
-                    st.markdown(f"""
-                    <div class="action-item">
-                        👉 {act}
-                    </div>
-                    """, unsafe_allow_html=True)
+            # Actionable Recommendations
+            st.markdown("#### 🛡️ Actionable Next Steps")
+            for act in fused.actionable_recommendations:
+                st.markdown(f"<div class='action-item'>👉 {act}</div>", unsafe_allow_html=True)
 
+            # Explicit Uncertainty & Legal Disclaimer
             st.markdown("""
             <div class="disclaimer-box">
                 <b>⚠️ Important AI Decision-Support Disclaimer:</b><br>
-                ScamLens is an automated advisory tool powered by large language model heuristics. It does <b>not</b> guarantee that a communication is safe or fraudulent. Sophisticated threats may evade detection, and benign messages can sometimes trigger false alarms. Never share passwords or PINs with anyone. Always verify unexpected requests through trusted, officially published contact channels.
+                ScamLens is an automated advisory tool powered by large language models, static heuristics, and threat registries.
+                It does <b>not</b> provide legal proof that a communication is safe or fraudulent.
+                Absence of threat matches does not guarantee safety for new domains. Never share passwords or PINs. Always verify through official channels.
             </div>
             """, unsafe_allow_html=True)
 
