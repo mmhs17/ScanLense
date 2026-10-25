@@ -51,6 +51,7 @@ class URLFeatureReport(BaseModel):
     is_shortened: bool
     subdomain_count: int
     url_length: int
+    domain_entropy: float = Field(default=0.0, description="Shannon entropy measuring domain name randomness")
     heuristic_risk_score: int = Field(ge=0, le=100)
     risk_level: str
     indicators: List[URLFeatureIndicator] = Field(default_factory=list)
@@ -58,6 +59,17 @@ class URLFeatureReport(BaseModel):
         "Heuristic analysis identifies structural patterns commonly associated with deceptive websites. "
         "It evaluates syntax and domain layout without visiting or probing the destination server."
     )
+
+import math
+from collections import Counter
+
+def calculate_entropy(s: str) -> float:
+    """Calculates Shannon entropy of string to detect randomized/DGA domain names."""
+    if not s:
+        return 0.0
+    counts = Counter(s)
+    total = len(s)
+    return round(-sum((c / total) * math.log2(c / total) for c in counts.values()), 2)
 
 def is_ip_address(hostname: str) -> bool:
     """Checks whether hostname is a raw IPv4 or IPv6 address."""
@@ -199,6 +211,18 @@ def analyze_url_features(url: str) -> URLFeatureReport:
             severity="HIGH"
         ))
 
+    # 9. Domain Entropy & Algorithmic Randomness (DGA)
+    clean_domain = hostname.replace(".", "")
+    entropy = calculate_entropy(clean_domain)
+    if entropy >= 3.8 and len(clean_domain) >= 12 and not ip_host:
+        indicators.append(URLFeatureIndicator(
+            category="Domain Architecture",
+            flag="High Domain Entropy (Potential DGA/Randomized Attack Domain)",
+            evidence=f"Shannon entropy: {entropy:.2f} (threshold >= 3.8)",
+            explanation="Unusually high character randomness suggests an algorithmically generated domain (DGA) designed to evade static blacklists.",
+            severity="HIGH"
+        ))
+
     # Compute Heuristic Risk Score
     severity_weights = {"LOW": 5, "MEDIUM": 20, "HIGH": 40, "CRITICAL": 60}
     raw_score = sum(severity_weights.get(ind.severity, 10) for ind in indicators if ind.flag != "HTTPS Present (Not Proof of Safety)")
@@ -223,6 +247,7 @@ def analyze_url_features(url: str) -> URLFeatureReport:
         is_shortened=is_shortener,
         subdomain_count=subdomain_count,
         url_length=url_len,
+        domain_entropy=entropy,
         heuristic_risk_score=score,
         risk_level=level,
         indicators=indicators

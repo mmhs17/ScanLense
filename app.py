@@ -1,5 +1,5 @@
 """
-ScamLens: AI Scam Investigator
+ScamLens: AI Scam Investigator & SOC Intelligence Platform
 An explainable, multimodal cybersecurity decision-support platform powered by Google Gemini,
 Specialist ML Classification, URL Feature Engineering, Threat Intelligence, and Vision OCR.
 """
@@ -15,6 +15,8 @@ from typing import List, Optional, Tuple, Any, Dict
 from PIL import Image
 from dotenv import load_dotenv
 import streamlit as st
+import pandas as pd
+import altair as alt
 from pydantic import BaseModel, Field
 
 # Load local environment variables from .env if present
@@ -23,6 +25,7 @@ load_dotenv()
 # Import specialized modular engines
 from modules.url_threat_intel import (
     extract_urls,
+    normalize_url,
     URLThreatReport,
     ThreatIntelManager,
     GoogleSafeBrowsingProvider,
@@ -52,9 +55,7 @@ def sanitize_log_message(msg: str) -> str:
     """Removes API keys, tokens, and credentials from log messages to prevent credential leaks."""
     if not isinstance(msg, str):
         msg = str(msg)
-    # Redact query parameters or key=...
     msg = re.sub(r'(?i)(key|token|auth)=([^\s&]+)', r'\1=[REDACTED]', msg)
-    # Redact standard Google API key patterns (e.g. AIza..., AQ....)
     msg = re.sub(r'\b(AIza[0-9A-Za-z\-_]{35}|AQ\.[0-9A-Za-z\-_]{30,})\b', '[REDACTED_API_KEY]', msg)
     return msg
 
@@ -140,6 +141,13 @@ DEMO_EXAMPLES = {
     }
 }
 
+URL_DEMO_EXAMPLES = {
+    "url_paypal": "http://paypal.com.account-verify.xyz/login",
+    "url_ip": "http://192.168.1.100:8080/secure/auth",
+    "url_short": "http://bit.ly/fedex-tracking-package22",
+    "url_legit": "https://apple.com/support/account",
+}
+
 # --- Helper: Safe Image Processing ---
 def process_uploaded_image(uploaded_file, max_dimension=1600) -> Image.Image:
     """
@@ -188,20 +196,10 @@ def extract_retry_after(exc: Exception) -> Optional[float]:
     return None
 
 def classify_gemini_error(exc: Exception) -> str:
-    """
-    Classifies Gemini API exceptions into clear operational categories:
-    - 'auth': Invalid key or forbidden (non-retryable)
-    - 'invalid_request': Bad arguments or syntax (non-retryable)
-    - 'not_found': Model not found / deprecated (non-retryable on same model)
-    - 'transient_unavailable': 503, high demand, service unavailable (retryable)
-    - 'rate_limit': 429, resource exhausted (retryable)
-    - 'network': Connection/timeout socket error (retryable)
-    - 'unknown': Other unexpected error
-    """
+    """Classifies Gemini API exceptions into clear operational categories."""
     err_str = str(exc)
     err_str_lower = err_str.lower()
 
-    # 1. Authentication errors (Non-retryable)
     if (
         "api_key_invalid" in err_str_lower
         or ("400" in err_str and "key" in err_str_lower)
@@ -211,11 +209,9 @@ def classify_gemini_error(exc: Exception) -> str:
     ):
         return "auth"
 
-    # 2. Model not found or deprecated for this API key
     if "not_found" in err_str or "404" in err_str or "no longer available" in err_str_lower:
         return "not_found"
 
-    # 3. 503 / Transient high demand / unavailable
     if (
         "503" in err_str
         or "unavailable" in err_str_lower
@@ -225,15 +221,12 @@ def classify_gemini_error(exc: Exception) -> str:
     ):
         return "transient_unavailable"
 
-    # 4. 429 Rate limit / Quota exceeded
     if "429" in err_str or "resource_exhausted" in err_str_lower or "quota" in err_str_lower or "rate limit" in err_str_lower:
         return "rate_limit"
 
-    # 5. Network / Socket / Timeout
     if any(k in err_str_lower for k in ["timeout", "socket", "connection", "network", "winerror 10051", "errno 11001", "getaddrinfo", "read timeout"]):
         return "network"
 
-    # 6. Bad request
     if "400" in err_str or "invalid_argument" in err_str_lower:
         return "invalid_request"
 
@@ -250,11 +243,7 @@ def execute_gemini_generate_with_retry(
     max_delay: float = 8.0,
     jitter: float = 0.5,
 ) -> Tuple[Any, str]:
-    """
-    Invokes client.models.generate_content with bounded retries, exponential backoff,
-    jitter, and an optional fallback model for transient 503/429/network errors.
-    Never cycles indefinitely. Never hides authentication errors behind fallback messages.
-    """
+    """Invokes client.models.generate_content with bounded retries, exponential backoff, jitter, and fallback."""
     models_to_try = [primary_model]
     if fallback_model and fallback_model.strip() and fallback_model.strip() != primary_model.strip():
         models_to_try.append(fallback_model.strip())
@@ -290,7 +279,6 @@ def execute_gemini_generate_with_retry(
                     safe_msg,
                 )
 
-                # Non-retryable: Fail immediately without retrying or masking
                 if err_category == "auth":
                     raise GeminiAuthError(
                         "Gemini API rejected the API key as invalid or unauthorized. Please verify your GEMINI_API_KEY in .env."
@@ -301,7 +289,6 @@ def execute_gemini_generate_with_retry(
                         f"Invalid request sent to Gemini API: {safe_msg}"
                     ) from e
 
-                # Model not found or deprecated: if primary, switch to fallback immediately without wasting retries
                 if err_category == "not_found":
                     if not is_fallback and len(models_to_try) > 1:
                         logger.info("Model '%s' is not available. Switching immediately to fallback model '%s'.", current_model, models_to_try[1])
@@ -310,7 +297,6 @@ def execute_gemini_generate_with_retry(
                         f"Configured model '{current_model}' was not found or is not supported for this API key."
                     ) from e
 
-                # Transient errors (503 high demand, 429 rate limit, network disruption)
                 if err_category in ("transient_unavailable", "rate_limit", "network"):
                     if attempt < max_retries - 1:
                         retry_after = extract_retry_after(e)
@@ -322,16 +308,14 @@ def execute_gemini_generate_with_retry(
                         time.sleep(sleep_time)
                         continue
                     else:
-                        # Exhausted retries on this model
                         if not is_fallback and len(models_to_try) > 1:
                             logger.info(
                                 "Retries exhausted for primary model '%s' (transient %s). Trying configured fallback model...",
                                 current_model,
                                 err_category,
                             )
-                            break  # Proceed to fallback model
+                            break
                         else:
-                            # Retries exhausted on all available models
                             if err_category == "rate_limit":
                                 raise GeminiUnavailableError(
                                     "Gemini API rate limit or quota exceeded after retries. Please wait a moment and try again."
@@ -341,10 +325,8 @@ def execute_gemini_generate_with_retry(
                                     f"The Gemini AI service is currently experiencing high demand or transient disruption (503). Retries were exhausted on model '{current_model}'."
                                 ) from e
 
-                # Unknown error: do not retry indefinitely
                 raise GeminiAPIError(f"Unexpected Gemini API error: {safe_msg}") from e
 
-    # Fall-through if all models and attempts were exhausted
     safe_err = sanitize_log_message(str(last_error)) if last_error else "Service unavailable"
     raise GeminiUnavailableError(
         f"Gemini service remained unavailable across configured models: {safe_err}"
@@ -359,10 +341,7 @@ def analyze_with_gemini(
     max_retries: Optional[int] = None,
     client: Optional[Any] = None,
 ) -> ScamAnalysisResult:
-    """
-    Calls Google Gemini using the official google-genai SDK with structured output enforcement.
-    Applies bounded retries with exponential backoff & jitter and automatic fallback model switching.
-    """
+    """Calls Google Gemini using the official google-genai SDK with structured output enforcement."""
     api_key = os.getenv("GEMINI_API_KEY")
     if client is None:
         if not api_key or api_key.strip() in ("", "your_gemini_api_key_here"):
@@ -370,7 +349,6 @@ def analyze_with_gemini(
                 "GEMINI_API_KEY is not configured. Please add a valid key to your local .env file or environment."
             )
 
-    # Resolve model configuration
     if model_name is None:
         model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
     if not model_name:
@@ -413,7 +391,6 @@ def analyze_with_gemini(
             f"Analyze the following untrusted message for potential scam indicators:\n\"\"\"{text_input.strip()}\"\"\""
         )
 
-    # Configure generation
     gen_config = None
     if types is not None:
         gen_config = types.GenerateContentConfig(
@@ -423,7 +400,6 @@ def analyze_with_gemini(
             temperature=0.2,
         )
 
-    # Invoke with bounded retry and fallback
     response, used_model = execute_gemini_generate_with_retry(
         client=client,
         contents=contents,
@@ -433,7 +409,6 @@ def analyze_with_gemini(
         max_retries=max_retries,
     )
 
-    # Parse and validate response
     try:
         if hasattr(response, "parsed") and response.parsed is not None:
             if isinstance(response.parsed, ScamAnalysisResult):
@@ -451,7 +426,6 @@ def analyze_with_gemini(
             data = json.loads(raw_text.strip())
             result = ScamAnalysisResult.model_validate(data)
 
-        # Enforce that is_definitive is always false for explainable decision support
         result.is_definitive = False
         result.model_used = used_model
         return result
@@ -462,17 +436,89 @@ def analyze_with_gemini(
             f"Unable to parse structured scam analysis from the model output. Error: {safe_parse_err}"
         ) from e
 
+# --- Threat Vectors Analytics Computation ---
+def compute_threat_vectors(fused_report: Optional[FusedInvestigationReport], url_features: List[URLFeatureReport], ocr_evidence: Optional[OCRExtractedEvidence], classifier_result: Optional[ClassifierResult]) -> pd.DataFrame:
+    """Computes scores (0-100) across 5 core threat vectors for visual decomposition."""
+    score = fused_report.overall_risk_score if fused_report else 0
+    
+    # 1. Social Engineering & Pressure
+    urgency_val = 20
+    if fused_report:
+        for s in fused_report.fused_signals:
+            if any(k in s.indicator_title.lower() or k in s.rationale.lower() for k in ["urgency", "pressure", "countdown", "suspended", "locked"]):
+                urgency_val = max(urgency_val, 85)
+    if ocr_evidence and ocr_evidence.urgency_indicators:
+        urgency_val = max(urgency_val, 80)
+    if score >= 80:
+        urgency_val = max(urgency_val, 85)
+    elif score <= 25:
+        urgency_val = min(urgency_val, 15)
+
+    # 2. Credential Harvesting Risk
+    cred_val = 15
+    if fused_report:
+        for s in fused_report.fused_signals:
+            if any(k in s.finding.lower() or k in s.rationale.lower() for k in ["otp", "passcode", "password", "credentials", "banking"]):
+                cred_val = max(cred_val, 95)
+    if score >= 85 and urgency_val >= 80:
+        cred_val = max(cred_val, 85)
+    elif score <= 25:
+        cred_val = min(cred_val, 10)
+
+    # 3. Financial / Fee Demands
+    fin_val = 10
+    if ocr_evidence and ocr_evidence.payment_indicators:
+        fin_val = max(fin_val, 90)
+    if fused_report:
+        for s in fused_report.fused_signals:
+            if any(k in s.finding.lower() or k in s.rationale.lower() for k in ["fee", "payment", "$", "₹", "unpaid", "transfer", "refund"]):
+                fin_val = max(fin_val, 85)
+    if score <= 25:
+        fin_val = min(fin_val, 10)
+
+    # 4. Brand Impersonation
+    brand_val = 15
+    if url_features:
+        for uf in url_features:
+            for ind in uf.indicators:
+                if "brand impersonation" in ind.category.lower():
+                    brand_val = max(brand_val, 95)
+    if fused_report:
+        for s in fused_report.fused_signals:
+            if any(k in s.finding.lower() for k in ["chase", "usps", "bank", "wells", "paypal", "netflix", "apple", "fedex", "irs"]):
+                brand_val = max(brand_val, 80)
+    if score <= 25:
+        brand_val = min(brand_val, 10)
+
+    # 5. URL & Network Obfuscation
+    url_val = 10
+    if fused_report and fused_report.confirmed_threat_intel_match:
+        url_val = 100
+    elif url_features:
+        max_uf = max((uf.heuristic_risk_score for uf in url_features), default=10)
+        url_val = max(url_val, max_uf)
+    elif score <= 25:
+        url_val = min(url_val, 10)
+
+    return pd.DataFrame([
+        {"Vector": "Social Engineering Urgency", "Score": urgency_val},
+        {"Vector": "Credential Harvesting", "Score": cred_val},
+        {"Vector": "Financial / Fee Demands", "Score": fin_val},
+        {"Vector": "Brand Impersonation", "Score": brand_val},
+        {"Vector": "URL & Network Deception", "Score": url_val},
+    ])
+
 
 def render_ui():
     """Renders the Streamlit frontend UI."""
     st.set_page_config(
-        page_title="ScamLens — AI Scam Investigator",
+        page_title="ScamLens — SOC Intelligence & Scam Investigator",
         page_icon="🛡️",
         layout="wide",
         initial_sidebar_state="expanded"
     )
 
-    # Custom CSS for dark cybersecurity aesthetics
+    # Custom Classic Cybersecurity SOC Styling
     st.markdown("""
     <style>
         .stApp {
@@ -481,27 +527,27 @@ def render_ui():
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         }
         .scamlens-hero {
-            background: linear-gradient(135deg, rgba(20, 27, 45, 0.95) 0%, rgba(13, 17, 30, 0.95) 100%);
-            border: 1px solid rgba(99, 102, 241, 0.25);
-            border-radius: 16px;
-            padding: 24px 32px;
-            margin-bottom: 24px;
-            box-shadow: 0 8px 32px -4px rgba(0, 0, 0, 0.5), 0 0 20px 0 rgba(139, 92, 246, 0.1);
+            background: linear-gradient(135deg, rgba(15, 23, 42, 0.98) 0%, rgba(11, 15, 25, 0.98) 100%);
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            border-radius: 14px;
+            padding: 22px 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 8px 32px -4px rgba(0, 0, 0, 0.6), 0 0 15px 0 rgba(56, 189, 248, 0.1);
         }
         .hero-title {
-            font-size: 2.2rem;
+            font-size: 2.1rem;
             font-weight: 800;
             background: linear-gradient(90deg, #A78BFA 0%, #38BDF8 50%, #818CF8 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
-            margin-bottom: 6px;
+            margin-bottom: 4px;
             display: flex;
             align-items: center;
             gap: 12px;
         }
         .hero-tagline {
             color: #94A3B8;
-            font-size: 1.05rem;
+            font-size: 1.0rem;
             margin: 0;
         }
         .status-pill {
@@ -517,6 +563,44 @@ def render_ui():
             font-weight: 600;
             letter-spacing: 0.05em;
             text-transform: uppercase;
+        }
+        /* SOC Executive Metric Ribbon */
+        .soc-metric-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 14px;
+            margin-bottom: 22px;
+        }
+        .soc-metric-card {
+            background: #0F172A;
+            border: 1px solid #1E293B;
+            border-radius: 10px;
+            padding: 14px 18px;
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+            transition: border-color 0.2s ease;
+        }
+        .soc-metric-card:hover {
+            border-color: #38BDF8;
+        }
+        .soc-metric-label {
+            color: #94A3B8;
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+        .soc-metric-value {
+            font-size: 1.85rem;
+            font-weight: 800;
+            color: #F8FAFC;
+            line-height: 1.2;
+            font-family: monospace;
+        }
+        .soc-metric-sub {
+            font-size: 0.74rem;
+            color: #64748B;
+            margin-top: 4px;
         }
         .scam-card {
             background-color: #111827;
@@ -628,6 +712,30 @@ def render_ui():
             margin-top: 20px;
             line-height: 1.5;
         }
+        /* URL Security Scorecard */
+        .url-scorecard-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            margin: 14px 0;
+        }
+        .url-param-tile {
+            background: #0F172A;
+            border: 1px solid #1E293B;
+            border-radius: 8px;
+            padding: 10px 14px;
+        }
+        .url-param-label {
+            font-size: 0.72rem;
+            color: #94A3B8;
+            text-transform: uppercase;
+            font-weight: 700;
+        }
+        .url-param-val {
+            font-size: 0.95rem;
+            font-weight: 700;
+            margin-top: 2px;
+        }
         div[data-testid="stHorizontalBlock"] .stButton button {
             border-radius: 8px;
             font-weight: 600;
@@ -640,6 +748,8 @@ def render_ui():
         st.session_state.history = []
     if "input_text" not in st.session_state:
         st.session_state.input_text = ""
+    if "input_url" not in st.session_state:
+        st.session_state.input_url = ""
     if "current_result" not in st.session_state:
         st.session_state.current_result = None
     if "current_fused_report" not in st.session_state:
@@ -656,6 +766,8 @@ def render_ui():
         st.session_state.current_analyzed_content = None
     if "last_error" not in st.session_state:
         st.session_state.last_error = None
+    if "urls_scrutinized_count" not in st.session_state:
+        st.session_state.urls_scrutinized_count = 0
 
     # Hero Banner
     st.markdown("""
@@ -663,13 +775,45 @@ def render_ui():
         <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px;">
             <div>
                 <div class="hero-title">
-                    <span>🛡️ ScamLens</span>
+                    <span>🛡️ ScamLens: Threat Command</span>
                 </div>
-                <p class="hero-tagline">AI-Powered Scam Investigator & Multi-Source Evidence Fusion Platform</p>
+                <p class="hero-tagline">AI-Powered Scam Investigator & Multi-Source SOC Analytics Platform</p>
             </div>
             <div>
-                <span class="status-pill">● Multi-Engine Active</span>
+                <span class="status-pill">● SOC Engine Online</span>
             </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Top SOC Executive Telemetry Ribbon
+    history = st.session_state.history
+    total_checks = len(history)
+    avg_score = round(sum(item["risk_score"] for item in history) / total_checks, 1) if total_checks > 0 else 0.0
+    critical_count = sum(1 for item in history if item["risk_score"] >= 60)
+    urls_count = st.session_state.urls_scrutinized_count
+
+    st.markdown(f"""
+    <div class="soc-metric-grid">
+        <div class="soc-metric-card">
+            <div class="soc-metric-label">📡 Investigations</div>
+            <div class="soc-metric-value">{total_checks}</div>
+            <div class="soc-metric-sub">Session evaluations</div>
+        </div>
+        <div class="soc-metric-card">
+            <div class="soc-metric-label">⚡ Avg Threat Index</div>
+            <div class="soc-metric-value" style="color: {'#EF4444' if avg_score >= 60 else ('#F59E0B' if avg_score >= 30 else '#10B981')};">{avg_score}</div>
+            <div class="soc-metric-sub">Across active session</div>
+        </div>
+        <div class="soc-metric-card">
+            <div class="soc-metric-label">🚨 Severe Interceptions</div>
+            <div class="soc-metric-value" style="color: #F87171;">{critical_count}</div>
+            <div class="soc-metric-sub">High & Critical threats</div>
+        </div>
+        <div class="soc-metric-card">
+            <div class="soc-metric-label">🔗 URLs Decomposed</div>
+            <div class="soc-metric-value" style="color: #38BDF8;">{urls_count}</div>
+            <div class="soc-metric-sub">Reputation & feature audits</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -695,7 +839,7 @@ def render_ui():
 
         has_sb_key = bool(os.getenv("SAFE_BROWSING_API_KEY") or configured_key)
         st.markdown(f"🌐 **Safe Browsing**: `{'Enabled' if has_sb_key else 'Unconfigured'}`")
-        st.markdown(f"🤖 **NLP Classifier**: `Active (Heuristic + HF)`")
+        st.markdown(f"🤖 **Specialist NLP**: `Active (Heuristics + HF)`")
 
         st.markdown("---")
         st.markdown("### 📋 Synthetic Demo Scenarios")
@@ -705,20 +849,20 @@ def render_ui():
         with col_d1:
             if st.button("🚨 Urgent OTP", use_container_width=True, help="Simulate a high-risk OTP harvesting scam"):
                 st.session_state.input_text = DEMO_EXAMPLES["demo_otp"]["text"]
-                st.session_state.mode_selector = "Text Message"
+                st.session_state.mode_selector = "💬 Text Message"
                 st.session_state.last_error = None
                 st.rerun()
 
         with col_d2:
             if st.button("📦 Fake Delivery", use_container_width=True, help="Simulate a suspicious package fee smishing attempt"):
                 st.session_state.input_text = DEMO_EXAMPLES["demo_delivery"]["text"]
-                st.session_state.mode_selector = "Text Message"
+                st.session_state.mode_selector = "💬 Text Message"
                 st.session_state.last_error = None
                 st.rerun()
 
         if st.button("✅ Routine Reminder", use_container_width=True, help="Simulate a benign, standard appointment notification"):
             st.session_state.input_text = DEMO_EXAMPLES["demo_benign"]["text"]
-            st.session_state.mode_selector = "Text Message"
+            st.session_state.mode_selector = "💬 Text Message"
             st.session_state.last_error = None
             st.rerun()
 
@@ -726,8 +870,8 @@ def render_ui():
         st.markdown("### 🛡️ Fusion Architecture")
         st.markdown("""
         - **1. Gemini Vision/Text**: Deep multimodal LLM contextual analysis.
-        - **2. URL Threat Intel**: Real-time Google Safe Browsing API matches.
-        - **3. URL Feature Engineering**: Static domain spoofing, IP host, and shortener detection.
+        - **2. Safe Browsing v4**: Verified threat intelligence matches.
+        - **3. URL Feature Engineering**: Static spoofing, IP host, entropy, & shortener detection.
         - **4. Specialist Classifier**: Specialized phishing pattern scoring.
         - **5. OCR Engine**: Extracts visible text, sender details, and fee demands.
         """)
@@ -742,35 +886,39 @@ def render_ui():
             st.session_state.current_classifier_result = None
             st.session_state.current_ocr_evidence = None
             st.session_state.input_text = ""
+            st.session_state.input_url = ""
             st.session_state.current_analyzed_content = None
             st.session_state.last_error = None
+            st.session_state.urls_scrutinized_count = 0
             st.rerun()
 
     # Two Column Layout
     left_col, right_col = st.columns([1.1, 1], gap="large")
 
     with left_col:
-        st.markdown("### 🔍 Input Investigation")
+        st.markdown("### 🔍 Input Investigation & Telemetry")
         mode = st.radio(
-            "Choose Analysis Mode:",
-            ["Text Message", "Screenshot / Image Upload"],
+            "Choose Investigation Mode:",
+            ["💬 Text Message", "📸 Screenshot / Image Upload", "🔗 Direct URL & Domain Inspector"],
             horizontal=True,
             key="mode_selector"
         )
 
         text_to_analyze = ""
         image_to_analyze = None
+        target_url_to_analyze = ""
 
-        if mode == "Text Message":
+        if mode == "💬 Text Message":
             text_to_analyze = st.text_area(
                 "Paste suspicious message, SMS, email, or social media communication:",
                 value=st.session_state.input_text,
-                height=200,
+                height=180,
                 placeholder="e.g. Your bank account has been locked. Click here immediately to verify...",
                 help="Do not input actual passwords, private banking credentials, or personal secrets."
             )
             st.session_state.input_text = text_to_analyze
-        else:
+
+        elif mode == "📸 Screenshot / Image Upload":
             st.markdown("<p style='color:#94A3B8; font-size:0.9rem;'>Upload a screenshot of the suspicious text, email, or DM (PNG, JPG, WEBP):</p>", unsafe_allow_html=True)
             uploaded_file = st.file_uploader(
                 "Upload Screenshot",
@@ -790,12 +938,43 @@ def render_ui():
                 placeholder="e.g. Received via WhatsApp from unknown +44 number"
             )
 
+        else:
+            # Mode: Direct URL & Domain Inspector
+            st.markdown("<p style='color:#94A3B8; font-size:0.9rem;'>Inspect any suspicious URL or domain against Safe Browsing, Shannon entropy, brand spoofing, and structure heuristics:</p>", unsafe_allow_html=True)
+            target_url_to_analyze = st.text_input(
+                "Target URL / Domain:",
+                value=st.session_state.input_url,
+                placeholder="e.g. http://paypal.com.account-verify.xyz/login"
+            )
+            st.session_state.input_url = target_url_to_analyze
+
+            st.caption("Quick Demo Target URLs:")
+            q_cols = st.columns(4)
+            with q_cols[0]:
+                if st.button("🚨 Brand Spoof", use_container_width=True):
+                    st.session_state.input_url = URL_DEMO_EXAMPLES["url_paypal"]
+                    st.rerun()
+            with q_cols[1]:
+                if st.button("⚠️ Raw IP", use_container_width=True):
+                    st.session_state.input_url = URL_DEMO_EXAMPLES["url_ip"]
+                    st.rerun()
+            with q_cols[2]:
+                if st.button("📦 Shortener", use_container_width=True):
+                    st.session_state.input_url = URL_DEMO_EXAMPLES["url_short"]
+                    st.rerun()
+            with q_cols[3]:
+                if st.button("✅ Legit URL", use_container_width=True):
+                    st.session_state.input_url = URL_DEMO_EXAMPLES["url_legit"]
+                    st.rerun()
+
         action_col1, action_col2 = st.columns([2, 1])
         with action_col1:
-            analyze_clicked = st.button("🛡️ Investigate with ScamLens", type="primary", use_container_width=True)
+            btn_label = "🔍 Deconstruct & Audit URL" if mode == "🔗 Direct URL & Domain Inspector" else "🛡️ Investigate with ScamLens"
+            analyze_clicked = st.button(btn_label, type="primary", use_container_width=True)
         with action_col2:
             if st.button("Clear Input", use_container_width=True):
                 st.session_state.input_text = ""
+                st.session_state.input_url = ""
                 st.session_state.current_result = None
                 st.session_state.current_fused_report = None
                 st.session_state.current_url_features = []
@@ -807,44 +986,55 @@ def render_ui():
                 st.rerun()
 
         if analyze_clicked:
-            if mode == "Text Message" and (not text_to_analyze or not text_to_analyze.strip()):
+            if mode == "💬 Text Message" and (not text_to_analyze or not text_to_analyze.strip()):
                 st.warning("⚠️ Please paste a message or select a demo example before running analysis.")
-            elif mode == "Screenshot / Image Upload" and image_to_analyze is None:
+            elif mode == "📸 Screenshot / Image Upload" and image_to_analyze is None:
                 st.warning("⚠️ Please upload a valid image file (PNG, JPG, WEBP) before running analysis.")
+            elif mode == "🔗 Direct URL & Domain Inspector" and (not target_url_to_analyze or not target_url_to_analyze.strip()):
+                st.warning("⚠️ Please enter a target URL or select one of the demo targets above.")
             else:
                 with st.spinner("🔬 Fusing signals: Gemini Vision, Threat Intelligence, URL Engineering, and Classifier..."):
-                    # 1. Image OCR extraction if screenshot mode
-                    ocr_evidence: Optional[OCRExtractedEvidence] = None
-                    if image_to_analyze is not None:
-                        ocr_evidence = perform_screenshot_ocr(image_to_analyze)
-                        st.session_state.current_ocr_evidence = ocr_evidence
+                    # Process Direct URL mode or Content mode
+                    if mode == "🔗 Direct URL & Domain Inspector":
+                        clean_u = normalize_url(target_url_to_analyze)
+                        extracted_urls = [clean_u] if clean_u else [target_url_to_analyze.strip()]
+                        ocr_evidence = None
+                        text_for_classifier = f"Visit our website at {extracted_urls[0]} to verify your account"
+                    else:
+                        ocr_evidence = None
+                        if image_to_analyze is not None:
+                            ocr_evidence = perform_screenshot_ocr(image_to_analyze)
+                            st.session_state.current_ocr_evidence = ocr_evidence
 
-                    # 2. Extract and analyze URLs
-                    content_for_urls = (text_to_analyze or "")
-                    if ocr_evidence and ocr_evidence.raw_text:
-                        content_for_urls += " " + ocr_evidence.raw_text
+                        content_for_urls = (text_to_analyze or "")
+                        if ocr_evidence and ocr_evidence.raw_text:
+                            content_for_urls += " " + ocr_evidence.raw_text
 
-                    extracted_urls = extract_urls(content_for_urls)
+                        extracted_urls = extract_urls(content_for_urls)
+                        text_for_classifier = text_to_analyze if text_to_analyze.strip() else (ocr_evidence.raw_text if ocr_evidence else "")
+
+                    # 1. Static URL Feature Engineering
                     url_features = [analyze_url_features(u) for u in extracted_urls]
                     st.session_state.current_url_features = url_features
+                    st.session_state.urls_scrutinized_count += len(extracted_urls)
 
-                    # 3. URL Threat Intelligence lookups (Safe Browsing)
+                    # 2. Threat Intelligence lookups (Google Safe Browsing)
                     threat_mgr = ThreatIntelManager()
                     threat_reports = threat_mgr.check_urls(extracted_urls)
                     st.session_state.current_threat_reports = threat_reports
 
-                    # 4. Specialist Classifier
+                    # 3. Specialist Classifier
                     classifier = SpecialistClassifier()
-                    text_for_classifier = text_to_analyze if text_to_analyze.strip() else (ocr_evidence.raw_text if ocr_evidence else "")
                     classifier_res = classifier.classify(text_for_classifier)
                     st.session_state.current_classifier_result = classifier_res
 
-                    # 5. Gemini Multimodal Analysis (with retries and fallback)
+                    # 4. Gemini Multimodal Analysis
                     gemini_res = None
                     gemini_error = None
                     try:
+                        gemini_text = text_to_analyze if mode != "🔗 Direct URL & Domain Inspector" else f"Analyze this link: {extracted_urls[0]}"
                         gemini_res = analyze_with_gemini(
-                            text_input=text_to_analyze if text_to_analyze.strip() else None,
+                            text_input=gemini_text if gemini_text.strip() else None,
                             image_input=image_to_analyze
                         )
                         st.session_state.current_result = gemini_res
@@ -862,7 +1052,7 @@ def render_ui():
                         st.session_state.last_error = gemini_error
                         st.warning(f"⚠️ Gemini Analysis Issue: {gemini_error}")
 
-                    # 6. Multi-Source Evidence Fusion
+                    # 5. Multi-Source Evidence Fusion
                     fused_report = fuse_investigation_evidence(
                         gemini_result=gemini_res,
                         classifier_result=classifier_res,
@@ -873,7 +1063,7 @@ def render_ui():
                     )
                     st.session_state.current_fused_report = fused_report
 
-                    snippet = (text_to_analyze[:60] + "...") if text_to_analyze.strip() else f"Image Screenshot ({mode})"
+                    snippet = (extracted_urls[0] if mode == "🔗 Direct URL & Domain Inspector" else (text_to_analyze[:60] + "..." if text_to_analyze.strip() else f"Image Screenshot ({mode})"))
                     st.session_state.current_analyzed_content = snippet
 
                     st.session_state.history.insert(0, {
@@ -888,9 +1078,13 @@ def render_ui():
                         st.session_state.history.pop()
 
     with right_col:
-        st.markdown("### 📊 Fused Investigation Report")
+        st.markdown("### 📊 SOC Fused Investigation Report")
         fused: Optional[FusedInvestigationReport] = st.session_state.current_fused_report
         res: Optional[ScamAnalysisResult] = st.session_state.current_result
+        url_feats = st.session_state.current_url_features
+        threat_reps = st.session_state.current_threat_reports
+        ocr_ev = st.session_state.current_ocr_evidence
+        cls_res = st.session_state.current_classifier_result
 
         if fused is None:
             st.markdown("""
@@ -898,8 +1092,8 @@ def render_ui():
                 <div style="font-size: 3rem; margin-bottom: 12px;">🛡️</div>
                 <h4 style="color: #F1F5F9; margin-bottom: 8px;">Awaiting Multi-Source Investigation</h4>
                 <p style="color: #94A3B8; font-size: 0.95rem; max-width: 380px; margin: 0 auto;">
-                    Paste a suspicious message or upload a screenshot and click <b>Investigate with ScamLens</b>.
-                    Signals will be synthesized across Gemini, Threat Intelligence, URL Heuristics, and NLP Classifiers.
+                    Select an input mode and click <b>Investigate with ScamLens</b>.
+                    Signals are synthesized across Gemini Vision, Safe Browsing, Static URL Heuristics, and NLP Classifiers.
                 </p>
             </div>
             """, unsafe_allow_html=True)
@@ -933,7 +1127,6 @@ def render_ui():
                 </div>
                 """, unsafe_allow_html=True)
 
-            # Incomplete Analysis Notice if Gemini was unavailable
             if fused.is_incomplete:
                 st.markdown("""
                 <div style="background: rgba(245, 158, 11, 0.15); border: 1px solid #F59E0B; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px;">
@@ -944,7 +1137,6 @@ def render_ui():
                 </div>
                 """, unsafe_allow_html=True)
 
-            # Conflicting signals callout
             if fused.has_conflicting_signals:
                 st.markdown(f"""
                 <div style="background: rgba(139, 92, 246, 0.15); border: 1px solid #8B5CF6; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px;">
@@ -953,16 +1145,45 @@ def render_ui():
                 </div>
                 """, unsafe_allow_html=True)
 
-            # Overall Score Meter
+            # Overall Score Meter Card
             st.markdown(f"""
             <div class="risk-meter-container">
                 <span class="risk-badge {risk_class}">{level_label}</span>
                 <div class="risk-score-display" style="color: {score_color};">{score}<span style="font-size: 1.8rem; color: #64748B;">/100</span></div>
-                <p style="color: #94A3B8; margin: 0; font-size: 0.95rem;">Fused Multi-Signal Risk Score</p>
+                <p style="color: #94A3B8; margin: 0; font-size: 0.95rem;">Overall Multi-Signal Threat Index</p>
             </div>
             """, unsafe_allow_html=True)
 
             st.markdown("<br>", unsafe_allow_html=True)
+
+            # Multidimensional Threat Vector Breakdown Chart
+            st.markdown("#### 📊 Threat Vectors Decomposition")
+            df_vectors = compute_threat_vectors(fused, url_feats, ocr_ev, cls_res)
+            
+            vector_chart = (
+                alt.Chart(df_vectors)
+                .mark_bar(cornerRadiusTopRight=5, cornerRadiusBottomRight=5, height=18)
+                .encode(
+                    x=alt.X("Score:Q", scale=alt.Scale(domain=[0, 100]), title="Threat Intensity Index (0-100)"),
+                    y=alt.Y("Vector:N", sort=None, title=None),
+                    color=alt.Color(
+                        "Score:Q",
+                        scale=alt.Scale(domain=[0, 25, 55, 80, 100], range=["#10B981", "#38BDF8", "#F59E0B", "#F97316", "#EF4444"]),
+                        legend=None
+                    ),
+                    tooltip=["Vector", "Score"]
+                )
+                .properties(height=170)
+                .configure_axis(
+                    labelColor="#CBD5E1",
+                    titleColor="#94A3B8",
+                    gridColor="#1E293B",
+                    domainColor="#334155",
+                    labelFontSize=11
+                )
+                .configure_view(strokeOpacity=0)
+            )
+            st.altair_chart(vector_chart, use_container_width=True)
 
             # Executive Summary
             st.markdown("#### 📝 Unified Executive Summary")
@@ -974,14 +1195,71 @@ def render_ui():
 
             # Multi-Engine Detailed Breakdown Tabs
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                "🔗 URL Scorecard",
                 "🧠 Gemini AI",
-                "🌐 Threat Intel",
-                "🔬 URL Features",
+                "🌐 Safe Browsing",
                 "🤖 NLP Classifier",
                 "👁️ OCR Vision"
             ])
 
             with tab1:
+                # Dedicated URL Security Scorecard
+                if url_feats:
+                    for uf in url_feats:
+                        entropy_val = getattr(uf, "domain_entropy", 0.0)
+                        st.markdown(f"**Target URL:** `{uf.url}`")
+                        
+                        # 6-Tile Security Scorecard Grid
+                        st.markdown(f"""
+                        <div class="url-scorecard-grid">
+                            <div class="url-param-tile">
+                                <div class="url-param-label">Transport Protocol</div>
+                                <div class="url-param-val" style="color: {'#10B981' if uf.has_https else '#EF4444'};">
+                                    {'🔒 HTTPS' if uf.has_https else '⚠️ HTTP (Insecure)'}
+                                </div>
+                            </div>
+                            <div class="url-param-tile">
+                                <div class="url-param-label">Host Architecture</div>
+                                <div class="url-param-val" style="color: {'#EF4444' if uf.is_ip_host else '#10B981'};">
+                                    {'⚠️ Numeric IP Host' if uf.is_ip_host else '✅ Named Domain'}
+                                </div>
+                            </div>
+                            <div class="url-param-tile">
+                                <div class="url-param-label">Subdomain Depth</div>
+                                <div class="url-param-val" style="color: {'#EF4444' if uf.subdomain_count >= 3 else '#10B981'};">
+                                    {f"⚠️ {uf.subdomain_count} Levels (Deep)" if uf.subdomain_count >= 3 else f"{uf.subdomain_count} Level (Normal)"}
+                                </div>
+                            </div>
+                            <div class="url-param-tile">
+                                <div class="url-param-label">Shortener Obfuscation</div>
+                                <div class="url-param-val" style="color: {'#EF4444' if uf.is_shortened else '#10B981'};">
+                                    {'⚠️ Known Shortener' if uf.is_shortened else '✅ Direct Target'}
+                                </div>
+                            </div>
+                            <div class="url-param-tile">
+                                <div class="url-param-label">Shannon Entropy</div>
+                                <div class="url-param-val" style="color: {'#EF4444' if entropy_val >= 3.8 else '#38BDF8'};">
+                                    {entropy_val:.2f} bits {'(High DGA)' if entropy_val >= 3.8 else '(Normal)'}
+                                </div>
+                            </div>
+                            <div class="url-param-tile">
+                                <div class="url-param-label">URL Character Length</div>
+                                <div class="url-param-val" style="color: {'#F59E0B' if uf.url_length > 75 else '#10B981'};">
+                                    {uf.url_length} chars
+                                </div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        if uf.indicators:
+                            st.markdown("**Detected URL Flags & Heuristics:**")
+                            for ind in uf.indicators:
+                                ind_color = "#EF4444" if ind.severity == "CRITICAL" else ("#F97316" if ind.severity == "HIGH" else ("#F59E0B" if ind.severity == "MEDIUM" else "#10B981"))
+                                st.markdown(f"- <span style='color: {ind_color}; font-weight: bold;'>[{ind.severity}] {ind.flag}</span>: {ind.explanation}", unsafe_allow_html=True)
+                else:
+                    st.info("No external URLs detected in this communication.")
+
+            with tab2:
                 if res is not None:
                     if getattr(res, "model_used", None):
                         st.caption(f"🤖 Evaluated using: `{res.model_used}`")
@@ -1005,45 +1283,28 @@ def render_ui():
                 else:
                     st.info("Gemini analysis was unavailable for this session. See other tabs for local inspections.")
 
-            with tab2:
-                threat_reps = st.session_state.current_threat_reports
+            with tab3:
                 if threat_reps:
                     for tr in threat_reps:
                         status_color = "#EF4444" if tr.status == "MATCH_FOUND" else ("#10B981" if tr.status == "NO_MATCH" else "#F59E0B")
                         st.markdown(f"""
                         <div class="scam-card" style="border-left: 4px solid {status_color};">
-                            <b>URL:</b> <code>{tr.url}</code><br>
+                            <b>Target URL:</b> <code>{tr.url}</code><br>
                             <b>Provider:</b> {tr.provider}<br>
                             <b>Status:</b> <code>{tr.status}</code><br>
                             <p style="color: #CBD5E1; margin-top: 6px; font-size: 0.9rem;">{tr.details}</p>
                         </div>
                         """, unsafe_allow_html=True)
                 else:
-                    st.caption("No external URLs detected in message to query against reputation providers.")
-
-            with tab3:
-                url_feats = st.session_state.current_url_features
-                if url_feats:
-                    for uf in url_feats:
-                        st.markdown(f"""
-                        <div class="scam-card">
-                            <b>Target Domain:</b> <code>{uf.domain}</code> | <b>Heuristic Score:</b> <code>{uf.heuristic_risk_score}/100 ({uf.risk_level})</code><br>
-                            <b>HTTPS:</b> {'✅ Yes' if uf.has_https else '❌ No (HTTP)'} | <b>IP Host:</b> {'⚠️ Yes' if uf.is_ip_host else 'No'} | <b>Shortener:</b> {'⚠️ Yes' if uf.is_shortened else 'No'}
-                        </div>
-                        """, unsafe_allow_html=True)
-                        for ind in uf.indicators:
-                            st.markdown(f"- **[{ind.severity}] {ind.flag}**: {ind.explanation}")
-                else:
-                    st.caption("No external URLs found in the communication.")
+                    st.caption("No external URLs found to query against Google Safe Browsing.")
 
             with tab4:
-                cls_res: Optional[ClassifierResult] = st.session_state.current_classifier_result
                 if cls_res:
                     st.markdown(f"""
                     <div class="scam-card">
                         <b>Engine:</b> <code>{cls_res.engine}</code> ({cls_res.model_name})<br>
                         <b>Predicted Class:</b> <code>{cls_res.label}</code><br>
-                        <b>Raw Model Score:</b> <code>{cls_res.score:.3f}</code> (Heuristic metric, not calibrated probability)<br>
+                        <b>Raw Model Score:</b> <code>{cls_res.score:.3f}</code> (Heuristic metric, uncalibrated)<br>
                         <p style="color: #CBD5E1; margin-top: 6px; font-size: 0.9rem;"><b>Rationale:</b> {cls_res.explanation}</p>
                     </div>
                     """, unsafe_allow_html=True)
@@ -1051,7 +1312,6 @@ def render_ui():
                     st.caption("No text available for NLP classification.")
 
             with tab5:
-                ocr_ev: Optional[OCRExtractedEvidence] = st.session_state.current_ocr_evidence
                 if ocr_ev and ocr_ev.raw_text:
                     st.markdown(f"**OCR Engine:** `{ocr_ev.ocr_engine}` | **Notes:** {ocr_ev.notes}")
                     st.text_area("Visible Text Extracted from Screenshot", value=ocr_ev.raw_text, height=120, disabled=True)
@@ -1077,10 +1337,74 @@ def render_ui():
             </div>
             """, unsafe_allow_html=True)
 
-    # History Section
+    # Historical Session Threat Analytics & Timeline Section
     st.markdown("---")
-    st.markdown("### 🕒 Recent Investigations (Session Only)")
+    st.markdown("### 📈 SOC Historical Session Analytics")
+
     if st.session_state.history:
+        # Timeline and Risk breakdown charts
+        hist = st.session_state.history
+        timeline_records = []
+        for idx, item in enumerate(reversed(hist)):
+            timeline_records.append({
+                "Investigation": f"#{idx+1} ({item['time']})",
+                "Score": item["risk_score"],
+                "Risk Level": item["risk_level"],
+                "Mode": item.get("mode", "Text")
+            })
+        df_timeline = pd.DataFrame(timeline_records)
+
+        col_g1, col_g2 = st.columns([1.6, 1])
+        with col_g1:
+            st.markdown("##### ⏱️ Session Threat Score Timeline")
+            line_chart = (
+                alt.Chart(df_timeline)
+                .mark_line(point=True, color="#38BDF8", strokeWidth=2.5)
+                .encode(
+                    x=alt.X("Investigation:N", title=None, sort=None),
+                    y=alt.Y("Score:Q", scale=alt.Scale(domain=[0, 100]), title="Threat Score"),
+                    tooltip=["Investigation", "Score", "Risk Level", "Mode"]
+                )
+                .properties(height=180)
+                .configure_axis(
+                    labelColor="#CBD5E1",
+                    titleColor="#94A3B8",
+                    gridColor="#1E293B",
+                    domainColor="#334155"
+                )
+                .configure_view(strokeOpacity=0)
+            )
+            st.altair_chart(line_chart, use_container_width=True)
+
+        with col_g2:
+            st.markdown("##### 🎯 Risk Tier Distribution")
+            df_dist = df_timeline["Risk Level"].value_counts().reset_index()
+            df_dist.columns = ["Risk Level", "Count"]
+            color_scale = alt.Scale(
+                domain=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+                range=["#EF4444", "#F97316", "#F59E0B", "#10B981"]
+            )
+            bar_chart = (
+                alt.Chart(df_dist)
+                .mark_bar(cornerRadiusTopRight=4, cornerRadiusTopLeft=4)
+                .encode(
+                    x=alt.X("Risk Level:N", sort=None, title=None),
+                    y=alt.Y("Count:Q", title="Items"),
+                    color=alt.Color("Risk Level:N", scale=color_scale, legend=None),
+                    tooltip=["Risk Level", "Count"]
+                )
+                .properties(height=180)
+                .configure_axis(
+                    labelColor="#CBD5E1",
+                    titleColor="#94A3B8",
+                    gridColor="#1E293B",
+                    domainColor="#334155"
+                )
+                .configure_view(strokeOpacity=0)
+            )
+            st.altair_chart(bar_chart, use_container_width=True)
+
+        # Expandable History Logs
         for idx, item in enumerate(st.session_state.history):
             lvl = item['risk_level']
             with st.expander(f"{item['time']} — [{lvl} | Score: {item['risk_score']}] {item['snippet']}"):
@@ -1088,7 +1412,7 @@ def render_ui():
                 st.markdown(f"**Risk Level**: `{item['risk_level']}` | **Score**: `{item['risk_score']}/100`")
                 st.markdown(f"**Summary**: {item['summary']}")
     else:
-        st.caption("No previous investigations in this session. Analyzed items will appear here temporarily.")
+        st.caption("No previous investigations in this session. Run an investigation to generate analytics.")
 
 
 if __name__ == "__main__":
